@@ -20,12 +20,20 @@ pub struct ZoomConfigYaml {
     /// ズーム倍率 (1.0 ~ 50.0)
     #[serde(default = "default_zoom_level")]
     pub zoom_level: f32,
+    /// マウススクロールでズーム倍率を調整可能にするかどうか
+    #[serde(default = "default_scroll_adjustment")]
+    pub scroll_adjustment: bool,
+    /// スクロール1ノッチあたりのズーム変化量
+    #[serde(default = "default_scroll_step")]
+    pub scroll_step: f32,
 }
 
 fn default_zoom_key() -> String { "C".to_string() }
 fn default_smooth_animation() -> bool { true }
 fn default_animation_speed() -> f32 { 0.1 }
 fn default_zoom_level() -> f32 { 10.0 }
+fn default_scroll_adjustment() -> bool { true }
+fn default_scroll_step() -> f32 { 1.0 }
 
 impl Default for ZoomConfigYaml {
     fn default() -> Self {
@@ -34,6 +42,8 @@ impl Default for ZoomConfigYaml {
             smooth_animation: default_smooth_animation(),
             animation_speed: default_animation_speed(),
             zoom_level: default_zoom_level(),
+            scroll_adjustment: default_scroll_adjustment(),
+            scroll_step: default_scroll_step(),
         }
     }
 }
@@ -49,6 +59,10 @@ pub struct ZoomConfig {
     pub animation_speed: f32,
     /// ズーム倍率
     pub zoom_level: f32,
+    /// マウススクロールでズーム倍率を調整可能にするかどうか
+    pub scroll_adjustment: bool,
+    /// スクロール1ノッチあたりのズーム変化量
+    pub scroll_step: f32,
 }
 
 impl Default for ZoomConfig {
@@ -58,6 +72,8 @@ impl Default for ZoomConfig {
             smooth_animation: true,
             animation_speed: 0.1,
             zoom_level: 10.0,
+            scroll_adjustment: true,
+            scroll_step: 1.0,
         }
     }
 }
@@ -69,16 +85,26 @@ impl From<ZoomConfigYaml> for ZoomConfig {
             smooth_animation: yaml.smooth_animation,
             animation_speed: yaml.animation_speed.clamp(0.01, 1.0),
             zoom_level: yaml.zoom_level.clamp(1.0, 50.0),
+            scroll_adjustment: yaml.scroll_adjustment,
+            scroll_step: yaml.scroll_step.clamp(0.1, 10.0),
         }
     }
 }
 
 impl ZoomConfig {
-    /// 設定ファイルのパスを取得
-    fn config_path() -> PathBuf {
+    /// 設定ファイルのパスを取得 (mods/Zoom/config.yml)
+    pub fn config_path() -> PathBuf {
         let mut path = std::env::current_exe().unwrap_or_default();
-        path.pop();
-        path.push("zoom_config.yml");
+        path.pop(); // 実行ファイルのディレクトリ
+        path.push("mods");
+        path.push("Zoom");
+        
+        // ディレクトリが存在しない場合は作成
+        if !path.exists() {
+            let _ = fs::create_dir_all(&path);
+        }
+        
+        path.push("config.yml");
         path
     }
 
@@ -108,11 +134,20 @@ impl ZoomConfig {
     pub fn save(&self) -> std::io::Result<()> {
         let path = Self::config_path();
         
+        // 親ディレクトリが存在しない場合は作成
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        
         let yaml_config = ZoomConfigYaml {
             zoom_key: Self::key_to_string(self.zoom_key),
             smooth_animation: self.smooth_animation,
             animation_speed: self.animation_speed,
             zoom_level: self.zoom_level,
+            scroll_adjustment: self.scroll_adjustment,
+            scroll_step: self.scroll_step,
         };
         
         let header = r#"# Zoom Configuration File / ズーム設定ファイル
@@ -129,11 +164,17 @@ impl ZoomConfig {
 #   値が大きいほど速い
 #
 # zoom_level: ズーム倍率 (1.0 ~ 50.0)
+#
+# scroll_adjustment: マウススクロールでズーム倍率を調整
+#   true: ズーム中にスクロールで倍率変更可能
+#   false: スクロール調整を無効化
+#
+# scroll_step: スクロール1ノッチあたりのズーム変化量 (0.1 ~ 10.0)
 
 "#;
         
         let yaml_content = serde_yaml::to_string(&yaml_config)
-            .unwrap_or_else(|_| "zoom_key: C\nsmooth_animation: true\nanimation_speed: 0.1\nzoom_level: 10.0\n".to_string());
+            .unwrap_or_else(|_| "zoom_key: C\nsmooth_animation: true\nanimation_speed: 0.1\nzoom_level: 10.0\nscroll_adjustment: true\nscroll_step: 1.0\n".to_string());
         
         fs::write(path, format!("{}{}", header, yaml_content))
     }

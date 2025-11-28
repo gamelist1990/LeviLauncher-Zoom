@@ -1,10 +1,11 @@
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicI32, AtomicBool, Ordering};
+use std::thread;
 use minhook_sys::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
-    SetWindowsHookExW, CallNextHookEx,
-    WH_MOUSE_LL, MSLLHOOKSTRUCT, HHOOK,
+    SetWindowsHookExW, CallNextHookEx, GetMessageW,
+    WH_MOUSE_LL, MSLLHOOKSTRUCT, HHOOK, MSG,
 };
 use windows::Win32::Foundation::{WPARAM, LPARAM, LRESULT};
 
@@ -13,6 +14,7 @@ use crate::config_manager::{ZoomConfig, get_config, init_config};
 static ORIGINAL_RENDER_LEVEL: AtomicUsize = AtomicUsize::new(0);
 static MOUSE_HOOK: AtomicUsize = AtomicUsize::new(0);
 static SCROLL_DELTA: AtomicI32 = AtomicI32::new(0);
+static ZOOM_KEY_PRESSED: AtomicBool = AtomicBool::new(false);
 
 const WM_MOUSEWHEEL: u32 = 0x020A;
 
@@ -58,6 +60,24 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
     CallNextHookEx(hook, code, wparam, lparam)
 }
 
+/// マウスフック用のメッセージループスレッド
+fn start_mouse_hook_thread() {
+    thread::spawn(|| {
+        unsafe {
+            // マウスホイールフックをインストール
+            if let Ok(hook) = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) {
+                MOUSE_HOOK.store(hook.0 as usize, Ordering::Relaxed);
+                
+                // メッセージループ（フックが動作するために必要）
+                let mut msg: MSG = std::mem::zeroed();
+                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    // メッセージを処理（特に何もしない）
+                }
+            }
+        }
+    });
+}
+
 unsafe extern "C" fn detour_render_level(level_renderer: *mut LevelRenderer, screen_context: *mut c_void, unk: *mut c_void) {
     let original_addr = ORIGINAL_RENDER_LEVEL.load(Ordering::Relaxed);
     if original_addr != 0 {
@@ -76,16 +96,19 @@ unsafe extern "C" fn detour_render_level(level_renderer: *mut LevelRenderer, scr
                  
                  let is_zoom_key_pressed = GetAsyncKeyState(config.zoom_key) & 0x8000u16 as i16 != 0;
                  
-                 // ズーム中にマウスホイールで倍率を調整
-                 if is_zoom_key_pressed {
+                 // ズームキーの状態を更新（フック用）
+                 ZOOM_KEY_PRESSED.store(is_zoom_key_pressed, Ordering::Relaxed);
+                 
+                 // ズーム中にマウスホイールで倍率を調整（設定で有効な場合のみ）
+                 if is_zoom_key_pressed && config.scroll_adjustment {
                      let scroll_delta = SCROLL_DELTA.swap(0, Ordering::Relaxed);
                      if scroll_delta != 0 {
-                         // 120単位で1.0変更（スクロール1ノッチ = 120）
-                         let zoom_change = (scroll_delta as f32 / 120.0).round();
+                         // 120単位でscroll_step変更（スクロール1ノッチ = 120）
+                         let zoom_change = (scroll_delta as f32 / 120.0) * config.scroll_step;
                          CURRENT_ZOOM_LEVEL = (CURRENT_ZOOM_LEVEL + zoom_change).clamp(1.0, 50.0);
                          save_zoom_level(CURRENT_ZOOM_LEVEL, &config);
                      }
-                 } else {
+                 } else if !is_zoom_key_pressed {
                      // ズームキーが押されていない時はスクロールデルタをクリア
                      SCROLL_DELTA.store(0, Ordering::Relaxed);
                  }
@@ -118,10 +141,8 @@ pub unsafe fn initialize() {
     // 設定を初期化
     init_config();
     
-    // マウスホイールフックをインストール
-    if let Ok(hook) = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) {
-        MOUSE_HOOK.store(hook.0 as usize, Ordering::Relaxed);
-    }
+    // マウスホイールフックを別スレッドで開始
+    start_mouse_hook_thread();
     
     let base = windows::Win32::System::LibraryLoader::GetModuleHandleA(None).unwrap();
     
