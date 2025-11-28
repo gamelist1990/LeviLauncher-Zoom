@@ -1,9 +1,20 @@
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicI32, Ordering};
 use minhook_sys::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_C};
+use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+use windows::Win32::UI::WindowsAndMessaging::{
+    SetWindowsHookExW, CallNextHookEx,
+    WH_MOUSE_LL, MSLLHOOKSTRUCT, HHOOK,
+};
+use windows::Win32::Foundation::{WPARAM, LPARAM, LRESULT};
+
+use crate::config_manager::{ZoomConfig, get_config, init_config};
 
 static ORIGINAL_RENDER_LEVEL: AtomicUsize = AtomicUsize::new(0);
+static MOUSE_HOOK: AtomicUsize = AtomicUsize::new(0);
+static SCROLL_DELTA: AtomicI32 = AtomicI32::new(0);
+
+const WM_MOUSEWHEEL: u32 = 0x020A;
 
 
 const RENDER_LEVEL_SIG: &[u8] = &[
@@ -29,7 +40,23 @@ struct LevelRendererPlayer {
 }
 
 static mut ZOOM_MODIFIER: f32 = 1.0;
-static TARGET_ZOOM: f32 = 10.0;
+static mut CURRENT_ZOOM_LEVEL: f32 = 10.0;
+
+/// マウスホイールのフックプロシージャ
+unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 && wparam.0 as u32 == WM_MOUSEWHEEL {
+        let mouse_struct = lparam.0 as *const MSLLHOOKSTRUCT;
+        if !mouse_struct.is_null() {
+            // mouseDataの上位ワードにホイールデルタが含まれている
+            let wheel_delta = ((*mouse_struct).mouseData >> 16) as i16 as i32;
+            // デルタを蓄積（120単位で1ノッチ）
+            SCROLL_DELTA.fetch_add(wheel_delta, Ordering::Relaxed);
+        }
+    }
+    
+    let hook = HHOOK(MOUSE_HOOK.load(Ordering::Relaxed) as isize);
+    CallNextHookEx(hook, code, wparam, lparam)
+}
 
 unsafe extern "C" fn detour_render_level(level_renderer: *mut LevelRenderer, screen_context: *mut c_void, unk: *mut c_void) {
     let original_addr = ORIGINAL_RENDER_LEVEL.load(Ordering::Relaxed);
@@ -41,12 +68,37 @@ unsafe extern "C" fn detour_render_level(level_renderer: *mut LevelRenderer, scr
         if !level_renderer.is_null() {
              let player = (*level_renderer).player;
              if !player.is_null() {
-                 let is_c_pressed = GetAsyncKeyState(VK_C.0 as i32) & 0x8000u16 as i16 != 0;
+                 // 設定を取得（ファイルが更新されていたら自動で再読み込み）
+                 let config = get_config();
                  
-                 let target = if is_c_pressed { TARGET_ZOOM } else { 1.0 };
+                 // 保存されたズーム倍率を使用
+                 CURRENT_ZOOM_LEVEL = config.zoom_level;
                  
+                 let is_zoom_key_pressed = GetAsyncKeyState(config.zoom_key) & 0x8000u16 as i16 != 0;
                  
-                 ZOOM_MODIFIER = ZOOM_MODIFIER + (target - ZOOM_MODIFIER) * 0.1;
+                 // ズーム中にマウスホイールで倍率を調整
+                 if is_zoom_key_pressed {
+                     let scroll_delta = SCROLL_DELTA.swap(0, Ordering::Relaxed);
+                     if scroll_delta != 0 {
+                         // 120単位で1.0変更（スクロール1ノッチ = 120）
+                         let zoom_change = (scroll_delta as f32 / 120.0).round();
+                         CURRENT_ZOOM_LEVEL = (CURRENT_ZOOM_LEVEL + zoom_change).clamp(1.0, 50.0);
+                         save_zoom_level(CURRENT_ZOOM_LEVEL, &config);
+                     }
+                 } else {
+                     // ズームキーが押されていない時はスクロールデルタをクリア
+                     SCROLL_DELTA.store(0, Ordering::Relaxed);
+                 }
+                 
+                 let target = if is_zoom_key_pressed { CURRENT_ZOOM_LEVEL } else { 1.0 };
+                 
+                 if config.smooth_animation {
+                     // スムーズアニメーション有効時: 補間で滑らかにズーム
+                     ZOOM_MODIFIER = ZOOM_MODIFIER + (target - ZOOM_MODIFIER) * config.animation_speed;
+                 } else {
+                     // スムーズアニメーション無効時: 即座にズーム
+                     ZOOM_MODIFIER = target;
+                 }
                  
                  (*player).fov_x *= ZOOM_MODIFIER;
                  (*player).fov_y *= ZOOM_MODIFIER;
@@ -55,7 +107,22 @@ unsafe extern "C" fn detour_render_level(level_renderer: *mut LevelRenderer, scr
     }
 }
 
+/// ズーム倍率を設定ファイルに保存
+fn save_zoom_level(zoom_level: f32, current_config: &ZoomConfig) {
+    let mut config = current_config.clone();
+    config.zoom_level = zoom_level;
+    let _ = config.save();
+}
+
 pub unsafe fn initialize() {
+    // 設定を初期化
+    init_config();
+    
+    // マウスホイールフックをインストール
+    if let Ok(hook) = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) {
+        MOUSE_HOOK.store(hook.0 as usize, Ordering::Relaxed);
+    }
+    
     let base = windows::Win32::System::LibraryLoader::GetModuleHandleA(None).unwrap();
     
     let dos_header = base.0 as *const windows::Win32::System::SystemServices::IMAGE_DOS_HEADER;
